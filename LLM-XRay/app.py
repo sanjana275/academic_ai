@@ -9,7 +9,12 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from tokenizer import load_tokenizer, tokenize_text, format_token_chips_markdown
+from tokenizer import (
+    load_tokenizer,
+    tokenize_text,
+    format_token_chips_markdown,
+    get_special_tokens_table
+)
 from model import (
     load_model,
     get_model_metadata,
@@ -120,6 +125,52 @@ st.markdown("""
         font-weight: 600;
         font-size: 0.95rem;
     }
+
+    /* Chat-style answer box */
+    .chat-wrapper {
+        margin-top: 18px;
+        margin-bottom: 10px;
+    }
+    .chat-question {
+        display: flex;
+        justify-content: flex-end;
+        margin-bottom: 10px;
+    }
+    .chat-question-bubble {
+        background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        color: #fff;
+        padding: 12px 18px;
+        border-radius: 18px 18px 4px 18px;
+        max-width: 75%;
+        font-size: 1rem;
+        font-weight: 500;
+        box-shadow: 0 4px 15px rgba(99,102,241,0.35);
+    }
+    .chat-answer {
+        display: flex;
+        justify-content: flex-start;
+        margin-bottom: 4px;
+    }
+    .chat-answer-bubble {
+        background: rgba(30, 41, 59, 0.85);
+        border: 1px solid rgba(99, 102, 241, 0.3);
+        color: #e2e8f0;
+        padding: 14px 20px;
+        border-radius: 18px 18px 18px 4px;
+        max-width: 85%;
+        font-size: 1.05rem;
+        line-height: 1.65;
+        backdrop-filter: blur(8px);
+        box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+    .chat-answer-label {
+        font-size: 0.75rem;
+        color: #818cf8;
+        font-weight: 600;
+        margin-bottom: 5px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -149,10 +200,23 @@ with st.sidebar:
         selected_model_name = model_choice
 
     st.markdown("---")
+    st.markdown("#### 💬 **Response & Special Tokens Mode**")
+    inference_mode = st.radio(
+        "Response Mode",
+        [
+            "🤖 Assistant / Chat Mode (Recommended)",
+            "📝 Raw Text Continuation Mode"
+        ],
+        index=0,
+        help="Assistant Mode formats prompts using chat templates with special tokens (<|im_start|>, <|im_end|>) so inputs like 'ai stands for' yield direct, intelligent answers ('AI stands for Artificial Intelligence'). Raw Mode continues text literally."
+    )
+    is_chat_mode = "Assistant" in inference_mode
+
+    st.markdown("---")
     st.markdown("#### ⚙️ **Generation Parameters**")
     temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=0.7, step=0.05,
                             help="Higher values make output more random, 0.0 is deterministic (greedy).")
-    max_new_tokens = st.slider("Max New Tokens", min_value=1, max_value=50, value=15, step=1,
+    max_new_tokens = st.slider("Max New Tokens", min_value=1, max_value=100, value=35, step=1,
                                help="Number of tokens to generate step-by-step.")
     top_k = st.slider("Top-K", min_value=0, max_value=100, value=50, step=5,
                       help="Keep only top K tokens with highest probability (0 to disable).")
@@ -256,21 +320,21 @@ if model_loaded:
     st.markdown("### 💬 **Prompt Input**")
     
     # Preset quick buttons
-    preset_cols = st.columns([1.5, 1.5, 1.8, 1.8, 4])
-    default_prompt = "What is AI?"
+    preset_cols = st.columns([1.6, 1.5, 1.8, 1.8, 3.5])
+    default_prompt = "AI stands for"
     
     if "prompt_input" not in st.session_state:
         st.session_state["prompt_input"] = default_prompt
 
     with preset_cols[0]:
-        if st.button("💡 What is AI?"):
-            st.session_state["prompt_input"] = "What is AI?"
+        if st.button("💡 AI stands for"):
+            st.session_state["prompt_input"] = "AI stands for"
     with preset_cols[1]:
+        if st.button("🤖 What is AI?"):
+            st.session_state["prompt_input"] = "What is AI?"
+    with preset_cols[2]:
         if st.button("🇫🇷 Capital of France"):
             st.session_state["prompt_input"] = "The capital of France is"
-    with preset_cols[2]:
-        if st.button("🎭 To be or not to be"):
-            st.session_state["prompt_input"] = "To be or not to be, that is the"
     with preset_cols[3]:
         if st.button("🐍 Fibonacci Python"):
             st.session_state["prompt_input"] = "def fibonacci(n):"
@@ -279,59 +343,88 @@ if model_loaded:
         "Enter your prompt to send through the LLM X-Ray:",
         value=st.session_state["prompt_input"],
         height=70,
+        key="prompt_textarea",
         placeholder="Type a sentence or question here..."
     )
+    # Always sync the text area value back so the model uses what the user typed
+    st.session_state["prompt_input"] = prompt_text
 
     col_btn, col_info = st.columns([2, 5])
     with col_btn:
         run_inference = st.button("⚡ Run LLM X-Ray & Generate", type="primary", use_container_width=True)
 
-    # Store state across reruns so user can explore layers/heads without recomputing
-    if "xray_data" not in st.session_state or run_inference:
-        if run_inference or "xray_data" not in st.session_state:
-            with st.spinner("Extracting token embeddings, running Transformer forward pass, and sampling tokens..."):
-                # 1. Tokenize
-                tok_res = tokenize_text(tokenizer, prompt_text)
-                input_ids_tensor = tok_res["encoding"]["input_ids"]
+    # Store state across reruns so user can explore layers/heads without recomputing.
+    # Only run inference when the user explicitly clicks the button.
+    if run_inference:
+        with st.spinner("Tokenizing, formatting special tokens, and running Transformer forward pass..."):
+            # 1. Tokenize user input
+            user_tok_res = tokenize_text(tokenizer, prompt_text)
 
-                # 2. Extract Embeddings
-                embed_res = extract_embeddings(model, input_ids_tensor, device)
-
-                # 3. Forward pass for Prompt inspection (Attentions, Hidden States, Logits)
-                fwd_res = run_xray_forward(
-                    model,
-                    tokenizer,
-                    input_ids_tensor,
-                    device,
-                    top_k_candidates=top_k_candidates_inspect,
-                    temperature=temperature
+            # 2. In Assistant mode, format with special tokens (<|im_start|>, <|im_end|>)
+            if is_chat_mode and hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+                messages = [
+                    {"role": "system", "content": "You are a helpful, knowledgeable AI assistant. Provide clear, direct, and accurate answers."},
+                    {"role": "user", "content": prompt_text}
+                ]
+                formatted_prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
                 )
+                fwd_tok_res = tokenize_text(tokenizer, formatted_prompt)
+            else:
+                formatted_prompt = prompt_text
+                fwd_tok_res = user_tok_res
 
-                # 4. Autoregressive step-by-step generation
-                gen_progress = st.progress(0, text="Generating autoregressive response...")
-                def update_progress(current_step, total):
-                    gen_progress.progress(current_step / total, text=f"Generated token {current_step}/{total}...")
+            input_ids_tensor = fwd_tok_res["encoding"]["input_ids"]
 
-                gen_res = generate_autoregressive_trace(
-                    model,
-                    tokenizer,
-                    prompt_text,
-                    device,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    status_callback=update_progress
-                )
-                gen_progress.empty()
+            # 3. Extract Embeddings
+            embed_res = extract_embeddings(model, input_ids_tensor, device)
 
-                st.session_state["xray_data"] = {
-                    "prompt": prompt_text,
-                    "tok_res": tok_res,
-                    "embed_res": embed_res,
-                    "fwd_res": fwd_res,
-                    "gen_res": gen_res
-                }
+            # 4. Forward pass for Prompt inspection (Attentions, Hidden States, Logits)
+            fwd_res = run_xray_forward(
+                model,
+                tokenizer,
+                input_ids_tensor,
+                device,
+                top_k_candidates=top_k_candidates_inspect,
+                temperature=temperature
+            )
+
+            # 5. Autoregressive step-by-step generation
+            gen_progress = st.progress(0, text="Generating autoregressive response...")
+            def update_progress(current_step, total):
+                gen_progress.progress(current_step / total, text=f"Generated token {current_step}/{total}...")
+
+            gen_res = generate_autoregressive_trace(
+                model,
+                tokenizer,
+                prompt_text,
+                device,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                status_callback=update_progress,
+                use_chat_template=is_chat_mode
+            )
+            gen_progress.empty()
+
+            st.session_state["xray_data"] = {
+                "prompt": prompt_text,
+                "is_chat_mode": is_chat_mode,
+                "formatted_prompt": formatted_prompt,
+                "user_tok_res": user_tok_res,
+                "tok_res": fwd_tok_res,
+                "embed_res": embed_res,
+                "fwd_res": fwd_res,
+                "gen_res": gen_res
+            }
+
+    # If no inference has been run yet, show a friendly prompt and stop rendering
+    if "xray_data" not in st.session_state:
+        st.info("👆 **Enter a prompt above and click \"⚡ Run LLM X-Ray & Generate\" to start the inspection.**")
+        st.stop()
 
     data = st.session_state["xray_data"]
     tok_res = data["tok_res"]
@@ -339,15 +432,34 @@ if model_loaded:
     fwd_res = data["fwd_res"]
     gen_res = data["gen_res"]
 
-    # Quick Response Banner
-    st.markdown("---")
-    st.markdown("#### 🤖 **Generated Output**")
-    col_out_text, col_out_meta = st.columns([3, 1])
-    with col_out_text:
-        st.success(f"**Prompt:** *{data['prompt']}*\n\n**Response:** {gen_res['full_response']}")
-    with col_out_meta:
+    # ── Chat-style Answer Box (appears immediately below the Run button) ──
+    stop_reason = gen_res.get("stop_reason", "")
+    stop_badge = f'<span style="font-size:0.75rem; background:rgba(99,102,241,0.25); color:#a5b4fc; border:1px solid rgba(99,102,241,0.4); border-radius:9999px; padding:2px 8px; margin-left:8px; text-transform:none;">🏁 {stop_reason}</span>' if stop_reason else ""
+
+    st.markdown("""
+    <div class="chat-wrapper">
+        <div class="chat-question">
+            <div class="chat-question-bubble">💬 {question}</div>
+        </div>
+        <div class="chat-answer">
+            <div class="chat-answer-bubble">
+                <div class="chat-answer-label">🤖 LLM Response {stop_badge}</div>
+                {answer}
+            </div>
+        </div>
+    </div>
+    """.format(
+        question=data['prompt'].replace('<', '&lt;').replace('>', '&gt;'),
+        stop_badge=stop_badge,
+        answer=gen_res['full_response'].replace('<', '&lt;').replace('>', '&gt;') or "<em style='color:#64748b'>(no text generated — try increasing Max New Tokens)</em>"
+    ), unsafe_allow_html=True)
+
+    # Small meta row
+    col_out_meta1, col_out_meta2, col_out_meta3 = st.columns([1, 1, 4])
+    with col_out_meta1:
         st.metric("New Tokens Generated", gen_res['total_new_tokens'])
-        st.metric("Next Token Uncertainty (Entropy)", f"{fwd_res['entropy']:.2f} bits")
+    with col_out_meta2:
+        st.metric("Entropy", f"{fwd_res['entropy']:.2f} bits")
 
     # -------------------------------------------------------------
     # DETAILED X-RAY TABS
@@ -366,26 +478,55 @@ if model_loaded:
     # TAB 1: TOKENIZATION
     # -------------------------------------------------------------
     with tabs[0]:
-        st.markdown("### Step 4 — Tokenization Inspection")
+        st.markdown("### Step 4 — Tokenization & Special Tokens Inspection")
         st.markdown("""
         Before an LLM processes text, words and subwords are broken down by a **Byte-Pair Encoding (BPE)** tokenizer 
-        into discrete tokens, which map to unique integer **Token IDs** in the model's vocabulary table.
+        into discrete tokens. **Special Tokens** (such as `<|im_start|>`, `<|im_end|>`, and `<|endoftext|>`) serve as structural 
+        control tags that delimit system prompts, user turns, and model response boundaries.
         """)
 
-        st.markdown(f"**Total Tokens:** `{tok_res['num_tokens']}`")
-        
-        # Visual chips representation
-        st.markdown("#### Visual Token Chips:")
-        chips_html = format_token_chips_markdown(tok_res["display_tokens"], tok_res["input_ids"])
-        st.markdown(chips_html, unsafe_allow_html=True)
+        user_tok_res = data.get("user_tok_res", tok_res)
+
+        col_t1, col_t2, col_t3 = st.columns(3)
+        with col_t1:
+            st.metric("User Prompt Tokens", user_tok_res["num_tokens"])
+        with col_t2:
+            st.metric("Total Model Tokens", tok_res["num_tokens"])
+        with col_t3:
+            st.metric("Special Control Tokens", tok_res.get("num_special_tokens", 0))
+
+        # Visual chips representation of user prompt
+        st.markdown("#### 💬 User Input Tokens:")
+        user_chips_html = format_token_chips_markdown(
+            user_tok_res["display_tokens"],
+            user_tok_res["input_ids"],
+            user_tok_res.get("is_special_list")
+        )
+        st.markdown(user_chips_html, unsafe_allow_html=True)
+
+        if data.get("is_chat_mode") and tok_res.get("num_special_tokens", 0) > 0:
+            with st.expander("🏷️ **View Full Formatted Chat Sequence (with Special Tokens `<|im_start|>`, `<|im_end|>`):**", expanded=True):
+                st.caption("Special tokens are highlighted in amber. They instruct the model to produce direct, helpful answers like 'AI stands for Artificial Intelligence'.")
+                full_chips_html = format_token_chips_markdown(
+                    tok_res["display_tokens"],
+                    tok_res["input_ids"],
+                    tok_res.get("is_special_list")
+                )
+                st.markdown(full_chips_html, unsafe_allow_html=True)
 
         st.markdown("#### Detailed Token Breakdown:")
         df_tokens = pd.DataFrame(tok_res["token_info"])
         st.dataframe(df_tokens, use_container_width=True, hide_index=True)
 
+        # Special Tokens Directory Expander
+        with st.expander("🔑 **Model Special Tokens Directory (Supported by Tokenizer):**", expanded=False):
+            st.markdown("The table below lists all control and boundary tokens registered in this model's vocabulary:")
+            sp_table = get_special_tokens_table(tokenizer)
+            st.dataframe(pd.DataFrame(sp_table), use_container_width=True, hide_index=True)
+
         st.markdown("#### Token ID Flow Representation:")
-        flow_tokens = " | ".join(tok_res["display_tokens"])
-        flow_ids = " | ".join(str(i) for i in tok_res["input_ids"])
+        flow_tokens = " | ".join(user_tok_res["display_tokens"])
+        flow_ids = " | ".join(str(i) for i in user_tok_res["input_ids"])
         st.code(f"Input:    {data['prompt']}\nTokens:   {flow_tokens}\nToken IDs:{flow_ids}", language="text")
 
     # -------------------------------------------------------------
@@ -488,12 +629,12 @@ if model_loaded:
             specs_df = pd.DataFrame([
                 {"Property": "Architecture Class", "Value": model_meta["model_type"].capitalize() + "ForCausalLM"},
                 {"Property": "Total Parameters", "Value": model_meta["num_params_formatted"]},
-                {"Property": "Transformer Decoder Layers", "Value": model_meta["num_layers"]},
-                {"Property": "Hidden Dimension (d_model)", "Value": model_meta["hidden_size"]},
-                {"Property": "Query Attention Heads", "Value": model_meta["num_heads"]},
-                {"Property": "Key / Value Attention Heads", "Value": model_meta["num_kv_heads"]},
-                {"Property": "Head Dimension", "Value": model_meta["head_dim"]},
-                {"Property": "Intermediate MLP Size", "Value": model_meta["intermediate_size"]},
+                {"Property": "Transformer Decoder Layers", "Value": str(model_meta["num_layers"])},
+                {"Property": "Hidden Dimension (d_model)", "Value": str(model_meta["hidden_size"])},
+                {"Property": "Query Attention Heads", "Value": str(model_meta["num_heads"])},
+                {"Property": "Key / Value Attention Heads", "Value": str(model_meta["num_kv_heads"])},
+                {"Property": "Head Dimension", "Value": str(model_meta["head_dim"])},
+                {"Property": "Intermediate MLP Size", "Value": str(model_meta["intermediate_size"])},
                 {"Property": "Activation Function", "Value": "SiLU (SwiGLU)"},
                 {"Property": "Positional Encoding", "Value": "RoPE (Rotary Position Embeddings)"},
                 {"Property": "Normalization", "Value": "RMSNorm"},
@@ -501,6 +642,7 @@ if model_loaded:
                 {"Property": "Inference Precision", "Value": model_meta["torch_dtype"]}
             ])
             st.dataframe(specs_df, use_container_width=True, hide_index=True)
+
 
     # -------------------------------------------------------------
     # TAB 4: ATTENTION HEATMAP
@@ -609,6 +751,7 @@ if model_loaded:
         top_tokens = [c["token"] for c in top_candidates]
         top_probs = [c["prob"] for c in top_candidates]
         top_ids = [c["id"] for c in top_candidates]
+        is_special_cands = [c.get("is_special", False) for c in top_candidates]
 
         first_gen_token = gen_res["generation_steps"][0]["token"] if gen_res["generation_steps"] else None
 
@@ -617,7 +760,8 @@ if model_loaded:
             top_probs=top_probs,
             top_ids=top_ids,
             selected_token=first_gen_token,
-            title="Top Candidates for Next Token Prediction"
+            is_special_list=is_special_cands,
+            title="Top Candidates for Next Token Prediction (⚡ Special in Amber)"
         )
         st.plotly_chart(prob_fig, use_container_width=True)
 
@@ -628,6 +772,7 @@ if model_loaded:
                 "Rank": i + 1,
                 "Candidate Token": c["token"],
                 "Token ID": c["id"],
+                "Is Special": "⚡ SPECIAL" if c.get("is_special") else "Standard",
                 "Probability (%)": f"{c['prob'] * 100:.2f}%",
                 "Logit Score": f"{fwd_res['last_logits'][c['id']]:.2f}",
                 "Selected": "✅ Chosen" if first_gen_token and c["token"] == first_gen_token else ""
@@ -651,6 +796,10 @@ if model_loaded:
         if not steps:
             st.warning("No new tokens generated. Check your prompt or max new tokens setting.")
         else:
+            # Termination status
+            stop_reason = gen_res.get("stop_reason", "Completed")
+            st.info(f"🏁 **Generation Status:** `{stop_reason}`")
+
             # Timeline Confidence Chart
             timeline_fig = plot_autoregressive_timeline(steps)
             st.plotly_chart(timeline_fig, use_container_width=True)
@@ -663,9 +812,14 @@ if model_loaded:
             col_s1, col_s2 = st.columns([1, 1])
 
             with col_s1:
-                st.markdown(f"**Step {active_step_data['step']} Token Chosen:** `{active_step_data['token']}` (ID: `{active_step_data['id']}`)")
+                is_sp = active_step_data.get("is_special", False)
+                sp_badge = " [⚡ SPECIAL EOS TOKEN]" if is_sp else ""
+                st.markdown(f"**Step {active_step_data['step']} Token Chosen:** `{active_step_data['token']}`{sp_badge} (ID: `{active_step_data['id']}`)")
                 st.markdown(f"**Model Confidence:** `{active_step_data['prob']*100:.2f}%`")
                 st.markdown(f"**Step Uncertainty (Entropy):** `{active_step_data['entropy']:.2f} bits`")
+
+                if is_sp:
+                    st.success("✨ **Special Token Triggered:** The model emitted this special control token to cleanly terminate generation.")
 
                 st.markdown("##### Cumulative Response at this Step:")
                 highlighted_text = f"*{data['prompt']}* **{active_step_data['cumulative_response']}**"
@@ -674,11 +828,13 @@ if model_loaded:
             with col_s2:
                 st.markdown("##### Top Competing Alternatives at this Step:")
                 step_cands = active_step_data["top_candidates"]
+                step_sp = [c.get("is_special", False) for c in step_cands]
                 step_fig = plot_top_k_probabilities(
                     top_tokens=[c["token"] for c in step_cands],
                     top_probs=[c["prob"] for c in step_cands],
                     top_ids=[c["id"] for c in step_cands],
                     selected_token=active_step_data["token"],
+                    is_special_list=step_sp,
                     title=f"Distribution at Step {active_step_data['step']}"
                 )
                 st.plotly_chart(step_fig, use_container_width=True)
@@ -691,6 +847,8 @@ if model_loaded:
                     "Step": s["step"],
                     "Emitted Token": s["token"],
                     "Token ID": s["id"],
+                    "Is Special": "⚡ SPECIAL" if s.get("is_special") else "Standard",
+                    "Role": s.get("role", "Standard Token"),
                     "Confidence": f"{s['prob']*100:.1f}%",
                     "Cumulative Output": s["cumulative_response"]
                 })

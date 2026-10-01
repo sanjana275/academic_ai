@@ -344,31 +344,40 @@ def plot_top_k_probabilities(
     top_probs: List[float],
     top_ids: List[int],
     selected_token: Optional[str] = None,
+    is_special_list: Optional[List[bool]] = None,
     title: str = "Next-Token Probability Distribution (Top Candidates)"
 ) -> go.Figure:
     """
     Horizontal bar chart showing top-k token predictions and their softmax probabilities.
+    Special tokens are highlighted in amber.
     """
     # Reverse so top candidate is at the top of the horizontal bar chart
     tokens_rev = top_tokens[::-1]
     probs_rev = [p * 100 for p in top_probs[::-1]]  # convert to percentage
     ids_rev = top_ids[::-1]
+    special_rev = is_special_list[::-1] if is_special_list else [False] * len(tokens_rev)
 
     colors = []
-    for t in tokens_rev:
-        if selected_token and t == selected_token:
+    labels = []
+    for t, is_sp in zip(tokens_rev, special_rev):
+        if is_sp:
+            colors.append("#f59e0b")  # amber for special tokens
+            labels.append(f"⚡ {t}")
+        elif selected_token and t == selected_token:
             colors.append("#22c55e")  # green highlight for sampled token
+            labels.append(f"'{t}'")
         else:
             colors.append("#6366f1")  # indigo for candidates
+            labels.append(f"'{t}'")
 
     hover_texts = [
-        f"<b>Token:</b> '{t}'<br><b>ID:</b> {tid}<br><b>Probability:</b> {p:.2f}%"
-        for t, tid, p in zip(tokens_rev, ids_rev, probs_rev)
+        f"<b>Token:</b> '{t}' {'(SPECIAL)' if sp else ''}<br><b>ID:</b> {tid}<br><b>Probability:</b> {p:.2f}%"
+        for t, tid, p, sp in zip(tokens_rev, ids_rev, probs_rev, special_rev)
     ]
 
     fig = go.Figure(go.Bar(
         x=probs_rev,
-        y=[f"'{t}'" for t in tokens_rev],
+        y=labels,
         orientation="h",
         marker=dict(
             color=colors,
@@ -403,6 +412,7 @@ def plot_autoregressive_timeline(generation_steps: List[Dict[str, Any]]) -> go.F
     """
     Plots the probability of the selected token at each generation step.
     Shows model confidence along the generated sequence.
+    Emphasizes terminal / special tokens (like <|im_end|>).
     """
     if not generation_steps:
         return go.Figure()
@@ -411,10 +421,14 @@ def plot_autoregressive_timeline(generation_steps: List[Dict[str, Any]]) -> go.F
     tokens = [s["token"] for s in generation_steps]
     probs = [s["prob"] * 100 for s in generation_steps]
     entropies = [s.get("entropy", 0.0) for s in generation_steps]
+    specials = [s.get("is_special", False) for s in generation_steps]
+
+    marker_colors = ["#f59e0b" if sp else "#34d399" for sp in specials]
+    marker_sizes = [14 if sp else 10 for sp in specials]
 
     hover_texts = [
-        f"<b>Step {s}:</b> '{t}'<br><b>Confidence:</b> {p:.1f}%<br><b>Entropy:</b> {e:.2f}"
-        for s, t, p, e in zip(step_nums, tokens, probs, entropies)
+        f"<b>Step {s}:</b> '{t}' {'[SPECIAL EOS]' if sp else ''}<br><b>Confidence:</b> {p:.1f}%<br><b>Entropy:</b> {e:.2f}"
+        for s, t, p, e, sp in zip(step_nums, tokens, probs, entropies, specials)
     ]
 
     fig = go.Figure()
@@ -427,7 +441,7 @@ def plot_autoregressive_timeline(generation_steps: List[Dict[str, Any]]) -> go.F
         textposition="top center",
         textfont=dict(family="monospace", size=11),
         line=dict(color="#10b981", width=3),
-        marker=dict(size=10, color="#34d399", line=dict(width=2, color="#ffffff")),
+        marker=dict(size=marker_sizes, color=marker_colors, line=dict(width=2, color="#ffffff")),
         hoverinfo="text",
         hovertext=hover_texts,
         name="Confidence (%)"
@@ -435,7 +449,7 @@ def plot_autoregressive_timeline(generation_steps: List[Dict[str, Any]]) -> go.F
 
     fig.update_layout(
         **LAYOUT_DEFAULTS,
-        title="Autoregressive Generation Confidence Per Token",
+        title="Autoregressive Generation Confidence Per Token (⚡ Special tokens in Amber)",
         xaxis=dict(title="Generation Step", gridcolor="rgba(255,255,255,0.08)"),
         yaxis=dict(title="Confidence (%)", range=[0, 105], gridcolor="rgba(255,255,255,0.08)"),
         height=350,

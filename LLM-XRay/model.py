@@ -4,8 +4,7 @@ Handles loading Hugging Face models, inspecting forward passes,
 extracting embeddings, attention weights, hidden states, and next-token distributions.
 """
 
-from typing import Dict, Any, List, Tuple, Optional
-import math
+from typing import Dict, Any, List, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,43 +13,48 @@ import streamlit as st
 
 
 @st.cache_resource(show_spinner=False)
-def load_model(model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"):
+def load_model(model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"):
     """
-    Loads and caches the Hugging Face CausalLM model.
-    Optimized for local inference with CPU fallback or CUDA if available.
+    Bulletproof multi-strategy loader.
+    Tries 4 combinations (eager/default attn x full-RAM/device_map) so one always works.
+    Uses float32 on CPU to avoid NaN issues with float16 on CPU-only machines.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    last_error = None
 
-    try:
+    # Strategy A: load fully into RAM then .to(device) -- most reliable
+    for attn_impl in ("eager", None):
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=dtype,
-                device_map=None,  # Manual device placement for full control
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-                attn_implementation="eager"
-            )
-        except Exception:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=dtype,
-                device_map=None,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
-            )
-            if hasattr(model, "set_attn_implementation"):
-                try:
-                    model.set_attn_implementation("eager")
-                except Exception:
-                    pass
+            kwargs = dict(torch_dtype=dtype, trust_remote_code=True)
+            if attn_impl:
+                kwargs["attn_implementation"] = attn_impl
+            model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+            model = model.to(device)
+            model.eval()
+            return model, device
+        except Exception as e:
+            last_error = e
 
-        model.to(device)
-        model.eval()
-        return model, device
-    except Exception as e:
-        raise RuntimeError(f"Error loading model '{model_name}': {str(e)}")
+    # Strategy B: device_map forces all layers to one device (no disk offload)
+    for attn_impl in ("eager", None):
+        try:
+            kwargs = dict(
+                torch_dtype=dtype,
+                device_map={"": device},
+                trust_remote_code=True,
+            )
+            if attn_impl:
+                kwargs["attn_implementation"] = attn_impl
+            model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+            model.eval()
+            return model, device
+        except Exception as e:
+            last_error = e
+
+    raise RuntimeError(
+        f"Could not load model '{model_name}'. Last error: {last_error}"
+    )
 
 
 def get_model_metadata(model) -> Dict[str, Any]:
@@ -185,10 +189,13 @@ def run_xray_forward(
 
     # Top-K candidate extraction
     top_values, top_indices = torch.topk(probs, k=min(top_k_candidates, len(probs)))
+    special_ids_set = set(getattr(tokenizer, "all_special_ids", []))
+    special_tokens_set = set(getattr(tokenizer, "all_special_tokens", []))
     
     top_candidates = []
     for val, idx in zip(top_values.tolist(), top_indices.tolist()):
         token_str = tokenizer.decode([idx])
+        is_sp = (idx in special_ids_set) or (token_str in special_tokens_set)
         # Clean representation
         if token_str == "\n":
             display_str = "\\n"
@@ -201,7 +208,8 @@ def run_xray_forward(
             "token": display_str,
             "raw_token": token_str,
             "id": idx,
-            "prob": float(val)
+            "prob": float(val),
+            "is_special": is_sp
         })
 
     return {
@@ -218,24 +226,51 @@ def generate_autoregressive_trace(
     tokenizer,
     prompt: str,
     device: str,
-    max_new_tokens: int = 15,
+    max_new_tokens: int = 35,
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 0.9,
-    status_callback=None
+    status_callback=None,
+    use_chat_template: bool = True,
+    system_prompt: Optional[str] = "You are a helpful, knowledgeable AI assistant. Provide clear, direct, and accurate answers."
 ) -> Dict[str, Any]:
     """
     Step-by-step autoregressive generation that records every token generated,
-    along with candidate distributions and probabilities.
+    along with candidate distributions, probabilities, and special token indicators.
+    Supports chat templates for instruct models so prompts receive direct, intelligent answers.
     """
-    inputs = tokenizer(prompt, return_tensors="pt")
+    if use_chat_template and hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    else:
+        formatted_prompt = prompt
+
+    inputs = tokenizer(formatted_prompt, return_tensors="pt")
     input_ids = inputs["input_ids"].to(device)
     prompt_len = input_ids.shape[1]
 
     generated_ids = input_ids.clone()
     generation_steps = []
     
-    eos_token_id = tokenizer.eos_token_id
+    stop_token_ids = set()
+    if tokenizer.eos_token_id is not None:
+        stop_token_ids.add(tokenizer.eos_token_id)
+    if getattr(tokenizer, "pad_token_id", None) is not None:
+        stop_token_ids.add(tokenizer.pad_token_id)
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if im_end_id is not None and isinstance(im_end_id, int) and im_end_id > 0:
+        stop_token_ids.add(im_end_id)
+    special_ids_set = set(getattr(tokenizer, "all_special_ids", [])) | stop_token_ids
+
+    stop_reason = f"Max new tokens ({max_new_tokens}) reached"
+    current_text = ""
 
     for step_i in range(1, max_new_tokens + 1):
         if status_callback:
@@ -276,7 +311,8 @@ def generate_autoregressive_trace(
             top_candidates.append({
                 "token": dec if dec.strip() else repr(dec),
                 "id": idx,
-                "prob": float(val)
+                "prob": float(val),
+                "is_special": (idx in special_ids_set)
             })
 
         # Calculate step entropy
@@ -292,12 +328,29 @@ def generate_autoregressive_trace(
         chosen_prob = float(probs[next_token_id].item())
         chosen_str = tokenizer.decode([next_token_id])
 
+        # If stop token, record termination step and break
+        if next_token_id in stop_token_ids:
+            generation_steps.append({
+                "step": step_i,
+                "token": chosen_str if chosen_str.strip() else repr(chosen_str),
+                "raw_token": chosen_str,
+                "id": next_token_id,
+                "prob": chosen_prob,
+                "top_candidates": top_candidates,
+                "entropy": step_entropy,
+                "cumulative_response": current_text,
+                "is_special": True,
+                "role": "EOS (End of Sequence - Generation Completed)"
+            })
+            stop_reason = f"Special EOS Token ({chosen_str.strip() or f'ID {next_token_id}'}) generated"
+            break
+
         # Append next token
         next_tensor = torch.tensor([[next_token_id]], device=device)
         generated_ids = torch.cat([generated_ids, next_tensor], dim=-1)
 
         # Decode entire sequence so far
-        current_text = tokenizer.decode(generated_ids[0][prompt_len:], skip_special_tokens=True)
+        current_text = tokenizer.decode(generated_ids[0][prompt_len:], skip_special_tokens=True).strip()
 
         generation_steps.append({
             "step": step_i,
@@ -307,17 +360,18 @@ def generate_autoregressive_trace(
             "prob": chosen_prob,
             "top_candidates": top_candidates,
             "entropy": step_entropy,
-            "cumulative_response": current_text
+            "cumulative_response": current_text,
+            "is_special": (next_token_id in special_ids_set),
+            "role": "Standard Token"
         })
 
-        if next_token_id == eos_token_id:
-            break
-
-    full_response = tokenizer.decode(generated_ids[0][prompt_len:], skip_special_tokens=True)
+    full_response = tokenizer.decode(generated_ids[0][prompt_len:], skip_special_tokens=True).strip()
     
     return {
         "full_response": full_response,
         "generation_steps": generation_steps,
         "total_new_tokens": len(generation_steps),
-        "all_input_ids": generated_ids
+        "all_input_ids": generated_ids,
+        "formatted_prompt": formatted_prompt,
+        "stop_reason": stop_reason
     }
